@@ -1,0 +1,632 @@
+import pandas as pd
+import numpy as np
+import warnings
+
+warnings.filterwarnings('ignore')
+
+from scipy.signal import savgol_filter
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_predict, StratifiedKFold, cross_validate
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef, confusion_matrix, make_scorer
+from sklearn.base import BaseEstimator, ClassifierMixin
+from tqdm import tqdm
+import joblib
+import os
+
+# ============================ Configuration ============================
+# Please modify the input file path here
+INPUT_FILE_PATH = r'G:Test.xlsx'  # Replace your_data.xlsx with your actual file path
+# Enable SG smoothing (True/False)
+ENABLE_SG_SMOOTHING = True
+# SG smoothing parameters
+SG_WINDOW_LENGTH = 7  # Window length
+SG_POLYORDER = 3  # Polynomial order
+
+
+# ================================================================
+
+class PLSDA(BaseEstimator, ClassifierMixin):
+    """Custom PLS-DA classifier"""
+
+    def __init__(self, n_components=2):
+        self.n_components = n_components
+        self.pls = PLSRegression(n_components=n_components)
+
+    def fit(self, X, y):
+        self.pls.fit(X, y)
+        # Calculate threshold
+        y_pred = self.pls.predict(X)
+        self.threshold = np.mean(y_pred)
+        return self
+
+    def predict(self, X):
+        y_pred = self.pls.predict(X)
+        return (y_pred > self.threshold).astype(int).flatten()
+
+    def get_params(self, deep=True):
+        return {"n_components": self.n_components}
+
+    def set_params(self, **params):
+        for param, value in params.items():
+            setattr(self, param, value)
+        return self
+
+
+def calculate_confusion_matrix_metrics(y_true, y_pred):
+    """Calculate confusion matrix and related metrics"""
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Handle binary classification case
+    if cm.shape == (2, 2):  # Binary classification
+        tn, fp, fn, tp = cm.ravel()
+    else:  # Multi-class case
+        # Calculate macro-average confusion matrix metrics
+        tn = np.sum(np.diag(cm)) - np.trace(cm) if np.sum(np.diag(cm)) > 0 else 0
+        fp = np.sum(cm) - np.sum(np.diag(cm)) - np.sum(np.diag(np.fliplr(cm))) if np.sum(cm) > 0 else 0
+        fn = np.sum(cm) - np.sum(np.diag(cm)) - np.sum(np.diag(np.fliplr(cm))) if np.sum(cm) > 0 else 0
+        tp = np.sum(np.diag(cm))
+
+    accuracy = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average='weighted')
+    mcc = matthews_corrcoef(y_true, y_pred)
+
+    return {
+        'TN': int(tn),
+        'FP': int(fp),
+        'FN': int(fn),
+        'TP': int(tp),
+        'accuracy': accuracy,
+        'f1_score': f1,
+        'mcc': mcc,
+        'confusion_matrix': cm
+    }
+
+
+class ModelTrainer:
+    def __init__(self, enable_sg=True, sg_window=7, sg_polyorder=3):
+        self.enable_sg = enable_sg
+        self.sg_window = sg_window
+        self.sg_polyorder = sg_polyorder
+        self.models = {}
+        self.results = {}
+        self.scaler = StandardScaler()
+
+    def apply_sg_smoothing(self, data):
+        """Apply SG smoothing - corrected version"""
+        print("Applying SG smoothing...")
+        smoothed_data = np.zeros_like(data)
+
+        # Check if window length is appropriate
+        n_features = data.shape[1]
+        if self.sg_window >= n_features:
+            print(f"Warning: Window length ({self.sg_window}) is greater than number of features ({n_features}), adjusting window length")
+            self.sg_window = min(self.sg_window, n_features)
+            if self.sg_window % 2 == 0:  # Window length must be odd
+                self.sg_window -= 1
+            print(f"Adjusted window length: {self.sg_window}")
+
+        for i in tqdm(range(data.shape[0]), desc="SG smoothing progress"):
+            # Apply SG smoothing to each sample (row)
+            try:
+                smoothed_data[i, :] = savgol_filter(
+                    data[i, :],
+                    window_length=self.sg_window,
+                    polyorder=self.sg_polyorder,
+                    mode='nearest'
+                )
+            except Exception as e:
+                print(f"Sample {i} smoothing failed: {e}")
+                smoothed_data[i, :] = data[i, :]  # Use original data if smoothing fails
+
+        return smoothed_data
+
+    def load_and_preprocess_data(self, file_path):
+        """Load and preprocess data"""
+        print(f"Loading data: {file_path}")
+        df = pd.read_excel(file_path, header=None)
+
+        # Separate features and labels
+        y = df.iloc[:, 0].values  # First column is labels
+        X = df.iloc[:, 1:].values  # Other columns are features
+
+        print(f"Data shape: X={X.shape}, y={y.shape}")
+        print(f"Label distribution: {pd.Series(y).value_counts().to_dict()}")
+
+        # Check data validity
+        if X.size == 0:
+            raise ValueError("Feature data is empty, please check data format")
+        if len(y) == 0:
+            raise ValueError("Label data is empty, please check data format")
+
+        # Apply SG smoothing if enabled
+        if self.enable_sg:
+            print(f"SG smoothing parameters: window_length={self.sg_window}, polyorder={self.sg_polyorder}")
+            # Ensure window length is less than or equal to number of features and odd
+            if self.sg_window > X.shape[1]:
+                self.sg_window = min(self.sg_window, X.shape[1])
+                if self.sg_window % 2 == 0:
+                    self.sg_window = max(3, self.sg_window - 1)
+                print(f"Automatically adjusted window length to: {self.sg_window}")
+
+            if self.sg_window < 3:
+                print("Warning: Too few features, skipping SG smoothing")
+            else:
+                X = self.apply_sg_smoothing(X)
+
+        return X, y
+
+    def split_data(self, X, y):
+        """Split data into training, validation, and test sets (6:2:2)"""
+        print("\nSplitting dataset...")
+
+        if len(y) < 10:
+            raise ValueError("Too few samples, at least 10 samples required for 6:2:2 split")
+
+        # First split into train+val and test sets (8:2)
+        X_train_val, X_test, y_train_val, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        # Then split train+val into train and val sets (6:2) from 80%, resulting in 6:2:2
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_val, y_train_val, test_size=0.25, random_state=42, stratify=y_train_val
+        )  # 0.25 * 0.8 = 0.2
+
+        print(f"Training set: {X_train.shape[0]} samples ({X_train.shape[0] / len(y) * 100:.1f}%)")
+        print(f"Validation set: {X_val.shape[0]} samples ({X_val.shape[0] / len(y) * 100:.1f}%)")
+        print(f"Test set: {X_test.shape[0]} samples ({X_test.shape[0] / len(y) * 100:.1f}%)")
+
+        # Data standardization
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        return X_train_scaled, X_val_scaled, X_test_scaled, y_train, y_val, y_test
+
+    def evaluate_model(self, model, X, y_true, dataset_name):
+        """Evaluate model performance, including confusion matrix"""
+        y_pred = model.predict(X)
+
+        # Calculate basic metrics
+        accuracy = accuracy_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred, average='weighted')
+        mcc = matthews_corrcoef(y_true, y_pred)
+
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+
+        # Handle binary and multi-class cases
+        if cm.shape == (2, 2):  # Binary classification
+            tn, fp, fn, tp = cm.ravel()
+        else:  # Multi-class, calculate macro average
+            # Convert multi-class to extended binary metrics
+            tn = np.sum(np.diag(cm)) - tp if 'tp' in locals() else 0
+            fp = np.sum(cm) - np.sum(np.diag(cm)) - fn if 'fn' in locals() else 0
+            fn = np.sum(cm) - np.sum(np.diag(cm)) - fp if 'fp' in locals() else 0
+            tp = np.sum(np.diag(cm))
+
+        # Calculate derived metrics
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # Specificity
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0  # Sensitivity/Recall
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0  # Precision
+
+        return {
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'mcc': mcc,
+            'confusion_matrix': {
+                'TN': int(tn),
+                'FP': int(fp),
+                'FN': int(fn),
+                'TP': int(tp),
+                'matrix': cm
+            },
+            'specificity': specificity,
+            'sensitivity': sensitivity,
+            'precision': precision
+        }
+
+    def perform_cross_validation(self, model, X, y, model_name, n_splits=5):
+        """Perform 5-fold cross-validation and print detailed results for each fold"""
+        print(f"\n{model_name} 5-fold cross-validation detailed results:")
+        print("=" * 70)
+
+        # Create 5-fold cross-validation object
+        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        fold_results = []
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X, y), 1):
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+
+            # Train model
+            model.fit(X_train_fold, y_train_fold)
+
+            # Predict validation set
+            y_pred_fold = model.predict(X_val_fold)
+
+            # Calculate metrics
+            metrics = calculate_confusion_matrix_metrics(y_val_fold, y_pred_fold)
+
+            # Store results
+            fold_results.append(metrics)
+
+            # Print results for this fold
+            print(f"\nFold {fold} results:")
+            print(f"  Training samples: {len(X_train_fold)}")
+            print(f"  Validation samples: {len(X_val_fold)}")
+            print(f"  Accuracy: {metrics['accuracy']:.4f}")
+            print(f"  F1-score: {metrics['f1_score']:.4f}")
+            print(f"  MCC: {metrics['mcc']:.4f}")
+            print(f"  Confusion matrix:")
+            print(f"    TN: {metrics['TN']:4d} | FP: {metrics['FP']:4d}")
+            print(f"    FN: {metrics['FN']:4d} | TP: {metrics['TP']:4d}")
+
+            # Print confusion matrix shape
+            print(f"  Confusion matrix shape: {metrics['confusion_matrix'].shape}")
+
+            # Print confusion matrix details
+            print(f"  Confusion matrix details:")
+            print(f"    {metrics['confusion_matrix']}")
+
+        # Calculate average metrics
+        avg_accuracy = np.mean([r['accuracy'] for r in fold_results])
+        avg_f1 = np.mean([r['f1_score'] for r in fold_results])
+        avg_mcc = np.mean([r['mcc'] for r in fold_results])
+        avg_tn = np.mean([r['TN'] for r in fold_results])
+        avg_fp = np.mean([r['FP'] for r in fold_results])
+        avg_fn = np.mean([r['FN'] for r in fold_results])
+        avg_tp = np.mean([r['TP'] for r in fold_results])
+
+        print(f"\n{model_name} 5-fold cross-validation average results:")
+        print(f"  Average accuracy: {avg_accuracy:.4f}")
+        print(f"  Average F1-score: {avg_f1:.4f}")
+        print(f"  Average MCC: {avg_mcc:.4f}")
+        print(f"  Average confusion matrix:")
+        print(f"    Avg TN: {avg_tn:.1f} | Avg FP: {avg_fp:.1f}")
+        print(f"    Avg FN: {avg_fn:.1f} | Avg TP: {avg_tp:.1f}")
+
+        return fold_results, {
+            'avg_accuracy': avg_accuracy,
+            'avg_f1': avg_f1,
+            'avg_mcc': avg_mcc,
+            'avg_tn': avg_tn,
+            'avg_fp': avg_fp,
+            'avg_fn': avg_fn,
+            'avg_tp': avg_tp
+        }
+
+    def perform_grid_search(self, model, param_grid, X, y, model_name):
+        """Perform grid search optimization"""
+        print(f"\nStarting {model_name} parameter optimization...")
+
+        # Create 5-fold cross-validation object
+        cv = StratifiedKFold(n_splits=min(5, len(np.unique(y))), shuffle=True, random_state=42)
+
+        # Create GridSearchCV object
+        grid_search = GridSearchCV(
+            estimator=model,
+            param_grid=param_grid,
+            cv=cv,
+            scoring='accuracy',
+            n_jobs=-1,  # Use all CPU cores
+            verbose=1  # Show detailed progress
+        )
+
+        # Perform grid search
+        print(f"{model_name} number of parameter combinations: {len(param_grid)}")
+        grid_search.fit(X, y)
+
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation accuracy: {grid_search.best_score_:.4f}")
+
+        return grid_search.best_estimator_, grid_search.best_params_
+
+    def print_confusion_matrix_details(self, cm_dict, model_name, dataset_name):
+        """Print detailed confusion matrix information"""
+        print(f"\n{model_name} {dataset_name} confusion matrix:")
+        print("=" * 50)
+        print(f"True Negative (TN): {cm_dict['TN']:4d} | False Positive (FP): {cm_dict['FP']:4d}")
+        print(f"False Negative (FN): {cm_dict['FN']:4d} | True Positive (TP): {cm_dict['TP']:4d}")
+        print("-" * 50)
+
+        # Create confusion matrix visualization
+        total = cm_dict['TN'] + cm_dict['FP'] + cm_dict['FN'] + cm_dict['TP']
+
+        if total > 0:
+            # Calculate percentages
+            tn_pct = cm_dict['TN'] / total * 100
+            fp_pct = cm_dict['FP'] / total * 100
+            fn_pct = cm_dict['FN'] / total * 100
+            tp_pct = cm_dict['TP'] / total * 100
+
+            print("Confusion matrix (percentage):")
+            print(f"      Pred 0     Pred 1")
+            print(f"True 0  {cm_dict['TN']:4d}({tn_pct:5.1f}%)  {cm_dict['FP']:4d}({fp_pct:5.1f}%)")
+            print(f"True 1  {cm_dict['FN']:4d}({fn_pct:5.1f}%)  {cm_dict['TP']:4d}({tp_pct:5.1f}%)")
+        print("=" * 50)
+
+    def train_models(self, X_train, X_val, X_test, y_train, y_val, y_test):
+        """Train all models"""
+
+        # Define models and parameter grids
+        models_config = {
+            'SVM': {
+                'model': SVC(random_state=42, probability=True),
+                'param_grid': {
+                    'C': [0.1, 1, 10],
+                    'kernel': ['linear', 'rbf'],
+                    'gamma': ['scale', 'auto']
+                }
+            },
+            'PLS-DA': {
+                'model': PLSDA(),
+                'param_grid': {
+                    'n_components': [2, 3, 4, 5]
+                }
+            },
+            'Random Forest': {
+                'model': RandomForestClassifier(random_state=42),
+                'param_grid': {
+                    'n_estimators': [50, 100],
+                    'max_depth': [None, 10],
+                    'min_samples_split': [2, 5],
+                    'min_samples_leaf': [1, 2]
+                }
+            }
+        }
+
+        # Adjust parameter grid size based on data size
+        if X_train.shape[0] < 100:  # Small sample dataset
+            print("Small sample dataset detected, simplifying parameter grids...")
+            models_config['SVM']['param_grid'] = {'C': [0.1, 1], 'kernel': ['rbf'], 'gamma': ['scale']}
+            models_config['PLS-DA']['param_grid'] = {'n_components': [2, 3]}
+            models_config['Random Forest']['param_grid'] = {'n_estimators': [50], 'max_depth': [None]}
+
+        best_models = {}
+        best_params = {}
+        cv_results_all = {}  # Store cross-validation results for all models
+
+        # Train each model
+        for name, config in models_config.items():
+            try:
+                print(f"\n{'=' * 60}")
+                print(f"Starting training {name} model")
+                print(f"{'=' * 60}")
+
+                # Step 1: Perform 5-fold CV with default parameters, print detailed results for each fold
+                default_model = config['model']
+                cv_fold_results, cv_avg_results = self.perform_cross_validation(
+                    default_model, X_train, y_train, f"{name} (default parameters)"
+                )
+                cv_results_all[f"{name} (default parameters)"] = {
+                    'fold_results': cv_fold_results,
+                    'avg_results': cv_avg_results
+                }
+
+                # Step 2: Perform grid search optimization
+                best_model, params = self.perform_grid_search(
+                    config['model'],
+                    config['param_grid'],
+                    X_train,
+                    y_train,
+                    name
+                )
+
+                best_models[name] = best_model
+                best_params[name] = params
+
+                # Step 3: Perform 5-fold CV with best parameters, print detailed results for each fold
+                best_cv_fold_results, best_cv_avg_results = self.perform_cross_validation(
+                    best_model, X_train, y_train, f"{name} (best parameters)"
+                )
+                cv_results_all[f"{name} (best parameters)"] = {
+                    'fold_results': best_cv_fold_results,
+                    'avg_results': best_cv_avg_results
+                }
+
+                # Step 4: Evaluate best model on validation set
+                val_results = self.evaluate_model(best_model, X_val, y_val, "Validation set")
+                print(f"\n{name} validation set results:")
+                print(f"  Accuracy: {val_results['accuracy']:.4f}")
+                print(f"  F1-score: {val_results['f1_score']:.4f}")
+                print(f"  MCC: {val_results['mcc']:.4f}")
+                print(f"  Specificity: {val_results['specificity']:.4f}")
+                print(f"  Sensitivity: {val_results['sensitivity']:.4f}")
+                print(f"  Precision: {val_results['precision']:.4f}")
+
+                # Print confusion matrix details
+                self.print_confusion_matrix_details(val_results['confusion_matrix'], name, "Validation set")
+
+            except Exception as e:
+                print(f"{name} training failed: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        if not best_models:
+            raise ValueError("All models failed to train, please check data and parameter settings")
+
+        self.models = best_models
+
+        # Print summary of all cross-validation results
+        self.print_cross_validation_summary(cv_results_all)
+
+        # Evaluate all models on test set
+        print("\n" + "=" * 60)
+        print("Test set results comparison")
+        print("=" * 60)
+
+        test_results = {}
+        for name, model in best_models.items():
+            results = self.evaluate_model(model, X_test, y_test, "Test set")
+            test_results[name] = results
+
+            print(f"\n{name}:")
+            print(f"  Best parameters: {best_params[name]}")
+            print(f"  Accuracy: {results['accuracy']:.4f}")
+            print(f"  F1-score: {results['f1_score']:.4f}")
+            print(f"  MCC: {results['mcc']:.4f}")
+            print(f"  Specificity: {results['specificity']:.4f}")
+            print(f"  Sensitivity: {results['sensitivity']:.4f}")
+            print(f"  Precision: {results['precision']:.4f}")
+
+            # Print confusion matrix details
+            self.print_confusion_matrix_details(results['confusion_matrix'], name, "Test set")
+
+        self.results = {
+            'best_params': best_params,
+            'test_results': test_results,
+            'cv_results': cv_results_all
+        }
+
+        return best_models, best_params, test_results
+
+    def print_cross_validation_summary(self, cv_results_all):
+        """Print cross-validation results summary"""
+        print(f"\n{'=' * 80}")
+        print("Cross-validation results summary")
+        print(f"{'=' * 80}")
+
+        for model_name, results in cv_results_all.items():
+            avg_results = results['avg_results']
+            print(f"\n{model_name}:")
+            print(f"  Average accuracy: {avg_results['avg_accuracy']:.4f}")
+            print(f"  Average F1-score: {avg_results['avg_f1']:.4f}")
+            print(f"  Average MCC: {avg_results['avg_mcc']:.4f}")
+            print(f"  Average confusion matrix metrics:")
+            print(f"    Avg TN: {avg_results['avg_tn']:.1f}")
+            print(f"    Avg FP: {avg_results['avg_fp']:.1f}")
+            print(f"    Avg FN: {avg_results['avg_fn']:.1f}")
+            print(f"    Avg TP: {avg_results['avg_tp']:.1f}")
+
+    def save_models(self, output_dir="saved_models"):
+        """Save trained models"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        for name, model in self.models.items():
+            # Remove special characters from filename
+            safe_name = name.replace("-", "_").replace(" ", "_")
+            filename = os.path.join(output_dir, f"{safe_name}_model.pkl")
+            joblib.dump(model, filename)
+            print(f"Model saved: {filename}")
+
+        # Save scaler
+        joblib.dump(self.scaler, os.path.join(output_dir, "scaler.pkl"))
+        print(f"Scaler saved")
+
+    def print_comparison_table(self):
+        """Print comparison table of results"""
+        if not self.results:
+            print("No results available for comparison")
+            return
+
+        print("\n" + "=" * 100)
+        print("Model performance comparison summary")
+        print("=" * 100)
+
+        # Create comparison table
+        comparison_data = []
+        for model_name, results in self.results['test_results'].items():
+            comparison_data.append({
+                'Model': model_name,
+                'Accuracy': f"{results['accuracy']:.4f}",
+                'F1-score': f"{results['f1_score']:.4f}",
+                'MCC': f"{results['mcc']:.4f}",
+                'Specificity': f"{results['specificity']:.4f}",
+                'Sensitivity': f"{results['sensitivity']:.4f}",
+                'Precision': f"{results['precision']:.4f}",
+                'TN': results['confusion_matrix']['TN'],
+                'FP': results['confusion_matrix']['FP'],
+                'FN': results['confusion_matrix']['FN'],
+                'TP': results['confusion_matrix']['TP'],
+                'Total': results['confusion_matrix']['TN'] + results['confusion_matrix']['FP'] +
+                          results['confusion_matrix']['FN'] + results['confusion_matrix']['TP']
+            })
+
+        # Print table
+        df_comparison = pd.DataFrame(comparison_data)
+        print(df_comparison.to_string(index=False))
+
+        # Find best model (based on accuracy)
+        if self.results['test_results']:
+            best_model_acc = max(self.results['test_results'].items(),
+                                 key=lambda x: x[1]['accuracy'])
+
+            # Find best model (based on MCC)
+            best_model_mcc = max(self.results['test_results'].items(),
+                                 key=lambda x: x[1]['mcc'])
+
+            # Find best model (based on F1-score)
+            best_model_f1 = max(self.results['test_results'].items(),
+                                key=lambda x: x[1]['f1_score'])
+
+            print(f"\nBest model based on accuracy: {best_model_acc[0]} (Accuracy: {best_model_acc[1]['accuracy']:.4f})")
+            print(f"Best model based on MCC: {best_model_mcc[0]} (MCC: {best_model_mcc[1]['mcc']:.4f})")
+            print(f"Best model based on F1-score: {best_model_f1[0]} (F1-score: {best_model_f1[1]['f1_score']:.4f})")
+
+            # Print best parameters for all models
+            print(f"\nBest parameters for all models:")
+            for model_name, params in self.results['best_params'].items():
+                print(f"{model_name}: {params}")
+
+
+def main():
+    """Main function"""
+    print("=" * 80)
+    print("Model Classification Program - Including detailed 5-fold cross-validation output")
+    print("=" * 80)
+    print(f"Input file: {INPUT_FILE_PATH}")
+    print(f"SG smoothing: {'Enabled' if ENABLE_SG_SMOOTHING else 'Disabled'}")
+    if ENABLE_SG_SMOOTHING:
+        print(f"SG window length: {SG_WINDOW_LENGTH}")
+        print(f"SG polynomial order: {SG_POLYORDER}")
+
+    # Create trainer instance
+    trainer = ModelTrainer(
+        enable_sg=ENABLE_SG_SMOOTHING,
+        sg_window=SG_WINDOW_LENGTH,
+        sg_polyorder=SG_POLYORDER
+    )
+
+    try:
+        # 1. Load and preprocess data
+        X, y = trainer.load_and_preprocess_data(INPUT_FILE_PATH)
+
+        # 2. Split dataset
+        X_train, X_val, X_test, y_train, y_val, y_test = trainer.split_data(X, y)
+
+        # 3. Train and optimize models
+        best_models, best_params, test_results = trainer.train_models(
+            X_train, X_val, X_test, y_train, y_val, y_test
+        )
+
+        # 4. Print comparison results
+        trainer.print_comparison_table()
+
+        # 5. Save models (optional)
+        save_models = input("\nSave models? (y/n): ").lower()
+        if save_models == 'y':
+            trainer.save_models()
+            print("Models saved successfully!")
+
+        print("\nProgram completed successfully!")
+
+    except FileNotFoundError:
+        print(f"Error: File not found '{INPUT_FILE_PATH}'")
+        print("Please modify the INPUT_FILE_PATH variable to the correct file path")
+    except ValueError as ve:
+        print(f"Data error: {ve}")
+    except Exception as e:
+        print(f"Program execution error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
